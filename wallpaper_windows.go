@@ -1,132 +1,88 @@
 package wallpaper
 
 import (
-	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
-	"syscall"
-	"unicode/utf16"
-	"unsafe"
+	"errors"
+	"strconv"
 
-	"golang.org/x/sys/windows/registry"
+	"github.com/austinhyde/wallpaper-go/winutils"
 )
 
-// Adapted from https://github.com/reujab/wallpaper/blob/master/windows.go
-// https://msdn.microsoft.com/en-us/library/windows/desktop/ms724947.aspx
-const (
-	spiGetDeskWallpaper = 0x0073
-	spiSetDeskWallpaper = 0x0014
-
-	uiParam = 0x0000
-
-	spifUpdateINIFile = 0x01
-	spifSendChange    = 0x02
-)
-
-var (
-	user32               = syscall.NewLazyDLL("user32.dll")
-	systemParametersInfo = user32.NewProc("SystemParametersInfoW")
-)
-
-func getWallpaperImpl() (string, error) {
-	var filename [256]uint16
-	_, _, err := systemParametersInfo.Call(
-		uintptr(spiGetDeskWallpaper),
-		uintptr(cap(filename)),
-		// the memory address of the first byte of the array
-		uintptr(unsafe.Pointer(&filename[0])),
-		uintptr(0),
-	)
-	if err != nil && err.Error() != "The operation completed successfully." {
-		return "", err
+func getDesktopImpl() (Desktop, error) {
+	monitors, err := winutils.GetMonitors()
+	if err != nil {
+		return nil, err
 	}
-	return strings.Trim(string(utf16.Decode(filename[:])), "\x00"), nil
+	desktop := &winDesktop{make([]Screen, len(monitors))}
+	for i, m := range monitors {
+		desktop.screens[i] = &winScreen{desktop, m, i}
+	}
+	return desktop, nil
 }
 
-func setWallpaperImpl(path string) error {
-	return setWallpaperWithStyleImpl(path, StyleCurrent)
+type winDesktop struct {
+	screens []Screen // really *winScreen
 }
 
-func setWallpaperWithStyleImpl(path string, style Style) error {
-	if style != StyleCurrent {
-		if err := setStyle(style); err != nil {
-			return err
-		}
-	}
-	return setWallpaper(path)
+// winDesktop implements Desktop
+
+func (w *winDesktop) GetScreens() ([]Screen, error) {
+	return w.screens, nil
 }
 
-func setStyleImpl(style Style) error {
-	// note: on windows, you need to re-set the current wallpaper for the style change to take effect
-	curr, err := GetWallpaper()
+// winDesktop implements Screen
+// https://docs.microsoft.com/en-us/windows/desktop/gdi/the-virtual-screen
+
+func (w *winDesktop) GetIdentifier() string {
+	return "desktop"
+}
+func (w *winDesktop) GetWallpaper() (*Wallpaper, error) {
+	wp, err := winutils.GetWallpaper()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if err = setStyle(style); err != nil {
-		return err
+	style, tile, err := winutils.GetWallpaperStyle()
+	if err != nil {
+		return nil, err
 	}
-	return setWallpaper(curr)
+	return &Wallpaper{wp, getStyleFromWin(style, tile)}, nil
 }
 
-func setWallpaper(path string) error {
-	path, err := filepath.Abs(path)
-	if err != nil {
-		return err
-	}
-	_, err = os.Stat(path)
-	if err != nil {
-		return err
-	}
-	filenameUTF16, err := syscall.UTF16PtrFromString(path)
-	if err != nil {
-		return err
-	}
-
-	_, _, err = systemParametersInfo.Call(
-		uintptr(spiSetDeskWallpaper),
-		uintptr(uiParam),
-		uintptr(unsafe.Pointer(filenameUTF16)),
-		uintptr(spifUpdateINIFile|spifSendChange),
-	)
-	if err != nil {
-		switch err.Error() {
-		case "The operation completed successfully.", "This operation returned because the timeout period expired.":
-			return nil
-		}
-		return err
-	}
-	return nil
+func (w *winDesktop) SetWallpaper(wp *Wallpaper) error {
+	return setWallpaperWithStyleImpl(wp.FilePath, wp.Style)
 }
 
-func setStyle(style Style) error {
-	if !style.IsValid() {
-		return fmt.Errorf("Invalid style parameter: '%s'", style)
-	}
-	// this is a no-op
-	if style == StyleCurrent {
-		return nil
-	}
+// winScreen implements Screen
 
-	// https://code.msdn.microsoft.com/windowsdesktop/CppSetDesktopWallpaper-eb969505
-	key, err := registry.OpenKey(registry.CURRENT_USER, "Control Panel\\Desktop", registry.READ|registry.WRITE)
-	defer key.Close()
-	if err != nil {
-		return err
-	}
-
-	err = key.SetExpandStringValue("WallpaperStyle", style.getWinStyle())
-	if err != nil {
-		return err
-	}
-	err = key.SetExpandStringValue("TileWallpaper", style.getWinTile())
-	if err != nil {
-		return err
-	}
-	return nil
+type winScreen struct {
+	desktop *winDesktop
+	monitor *winutils.Monitor
+	index   int
 }
 
-func (s Style) getWinStyle() string {
+func (s *winScreen) GetIdentifier() string {
+	if s.monitor.Name != "" {
+		return s.monitor.Name
+	}
+	return strconv.Itoa(s.index)
+}
+func (s *winScreen) GetWallpaper() (*Wallpaper, error) {
+	path, err := winutils.GetCurrentWallpaper(s.index)
+	if err != nil {
+		return nil, err
+	}
+	style, tile, err := winutils.GetWallpaperStyle()
+	if err != nil {
+		return nil, err
+	}
+	return &Wallpaper{path, getStyleFromWin(style, tile)}, nil
+}
+func (s *winScreen) SetWallpaper(*Wallpaper) error {
+	return errors.New("not implemented")
+}
+
+// Helpers
+
+func getWinStyle(s Style) string {
 	//  WallpaperStyle
 	//    0:  The image is centered if TileWallpaper=0 or tiled if TileWallpaper=1
 	//    2:  The image is stretched to fill the screen
@@ -145,7 +101,7 @@ func (s Style) getWinStyle() string {
 	// StyleFill
 	return "10"
 }
-func (s Style) getWinTile() string {
+func getWinTile(s Style) string {
 	// TileWallpaper
 	//    0: The wallpaper picture should not be tiled
 	//    1: The wallpaper picture should be tiled
@@ -153,4 +109,36 @@ func (s Style) getWinTile() string {
 		return "1"
 	}
 	return "0"
+}
+func getStyleFromWin(style string, tile string) Style {
+	if tile == "1" {
+		return StyleTile
+	}
+	switch style {
+	case "0":
+		return StyleCenter
+	case "2":
+		return StyleStretch
+	case "6":
+		return StyleFit
+	}
+	return StyleFill
+}
+
+func setWallpaperWithStyleImpl(path string, style Style) error {
+	if style != StyleCurrent {
+		if err := winutils.SetWallpaperStyle(getWinStyle(style), getWinTile(style)); err != nil {
+			return err
+		}
+	}
+	return winutils.SetWallpaper(path)
+}
+
+func setStyleImpl(style Style) error {
+	// note: on windows, you need to re-set the current wallpaper for the style change to take effect
+	curr, err := winutils.GetWallpaper()
+	if err != nil {
+		return err
+	}
+	return setWallpaperWithStyleImpl(curr, style)
 }
